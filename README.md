@@ -12,7 +12,7 @@
 
 ## ✨ 项目亮点
 
-- 🛡️ **人机验证**：新用户必须通过 Turnstile 验证，降低机器人骚扰和滥用风险。
+- 🛡️ **数字验证**：新用户先在 Telegram 私聊中回答一道简单算术题，降低机器人骚扰和滥用风险。
 - 💬 **独立话题沟通**：每个用户都在独立的 Telegram 话题（Forum）中对话，历史清晰、管理不串线。
 - ⚫️ **随时拉黑用户**：若不想再接收某个用户的消息，直接在群内关闭对应话题，即可拦截 TA 的所有后续消息。（市面上的bot几乎都没有一键屏蔽用户消息的功能）
 - 🖼️ **多媒体支持**：支持图片、视频、文件等消息类型的转发；文本消息支持 Telegram Markdown 格式。
@@ -43,7 +43,7 @@
 
 所有实际的 key/value（例如：
 - `user:<uid>` → `{ thread_id, title, closed }`
-- `verified:<uid>` / `verify:<token>` 等
+- `verified:<uid>` / `challenge:<uid>` 等
 ）都会由程序自动写入，无需手动创建。
 
 ---
@@ -58,9 +58,6 @@
 | `BOT_ID`            | 是   | 机器人自身 user id，就是 Bot Token 冒号前面的数字，例如 `123456789`        |
 | `SUPERGROUP_ID`     | 是   | 目标超级群 chat id，形如 `-100xxxxxxxxxx`                                  |
 | `API_BASE`          | 否   | 默认 `https://api.telegram.org`                                             |
-| `TURNSTILE_SITEKEY` | 否   | Turnstile Site Key，启用人机验证时必填                                      |
-| `TURNSTILE_SECRET`  | 否   | Turnstile Secret，启用人机验证时必填                                        |
-| `PUBLIC_BASE`       | 否   | Worker 公网地址，如 `https://tgbot.xxx.com`，用于生成验证链接               |
 
 > 获取 `SUPERGROUP_ID` 小技巧：
 > - 在 Telegram 桌面端右键群内任意消息，复制消息链接；
@@ -110,7 +107,7 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://tgbot.xxxx.com"
 
 ### 4. 功能验证
 
-1. 自己先私聊 bot，若启用 Turnstile，会先收到人机验证链接；验证通过后再继续。
+1. 自己先私聊 bot，会先收到一道算术题；直接回复答案数字，答对后再继续。
 2. 再发一条普通消息：
    - 超级群应自动创建一个以你昵称/`@username` 命名的话题；
    - 私聊消息会带引用转发到该话题中。
@@ -163,7 +160,7 @@ console.log(JSON.stringify(update, null, 2));
 
 - **2025-11-25**：修复用户端一次发送多媒体（相册消息）时会卡住、需等待后续消息才能一并推送的问题，新增 `ctx.waitUntil` 异步 flush，确保 2 秒超时即可自动发送;
 
-- 优化 Turnstile 验证体验：私聊通知中的验证链接改为“点击前往”超链接，避免裸露长 URL；同时美化 `/verify` 页面为居中卡片式布局，移动端更易操作。
+- **2026-08-26**：验证改为 Telegram 内直接回答随机算术题，不再依赖网页或 Cloudflare Turnstile；题目记录保存 15 分钟，答对后才允许转发消息。
 
 
 ---

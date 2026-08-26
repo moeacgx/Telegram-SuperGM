@@ -1,12 +1,7 @@
-// Cloudflare Worker 入口（Turnstile + 相册聚合：最多 10 张，2 秒超时 flush）
+// Cloudflare Worker 入口（Telegram 答题验证 + 相册聚合：最多 10 张，2 秒超时 flush）
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (url.pathname === "/verify") {
-      if (request.method === "GET") return renderVerifyPage(url, env);
-      if (request.method === "POST") return handleVerifySubmit(request, env);
-    }
-
+    try {
     if (request.method !== "POST") return new Response("OK");
 
     let update;
@@ -44,6 +39,18 @@ export default {
     }
 
     return new Response("OK");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("worker-request-failed", { message });
+      try {
+        await env.TOPIC_MAP.put(
+          "diag:last_error",
+          JSON.stringify({ message, timestamp: new Date().toISOString() }),
+          { expirationTtl: 3600 },
+        );
+      } catch {}
+      return new Response("Internal Server Error", { status: 500 });
+    }
   },
 };
 
@@ -52,34 +59,10 @@ async function handlePrivateMessage(msg, env, ctx) {
   const userId = msg.chat.id;
   const key = `user:${userId}`;
 
-  if (msg.text && msg.text.trim().toLowerCase().startsWith("/start")) return;
+  // Telegram 内答题验证。答题消息只用于验证，不会转发到客服群。
+  if (!(await handleVerificationMessage(msg, env))) return;
 
-  // Turnstile 验证
-  if (env.TURNSTILE_SECRET && env.TURNSTILE_SITEKEY) {
-    const verified = await isVerified(userId, env);
-    if (!verified) {
-      const token = crypto.randomUUID();
-      await env.TOPIC_MAP.put(`verify:${token}`, JSON.stringify({ uid: userId }), { expirationTtl: 900 });
-      const base = env.PUBLIC_BASE;
-      if (base) {
-        const link = `${base.replace(/\/$/, "")}/verify?token=${token}`;
-        const verifyText = [
-          "⚠️ 检测到这是你第一次使用，请先完成人机验证：",
-          `🔗 <a href="${link}">点击前往</a>`,
-          "",
-          "请在网页中看到“验证成功，请回到 Telegram 继续对话”提示后，",
-          "再回到这里继续发消息，否则会一直重复要求验证。"
-        ].join("\n");
-        await tgCall(env, "sendMessage", {
-          chat_id: userId,
-          text: verifyText,
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        });
-      }
-      return;
-    }
-  }
+  if (msg.text && msg.text.trim().toLowerCase().startsWith("/start")) return;
 
   let rec = await env.TOPIC_MAP.get(key, { type: "json" });
   if (rec && rec.closed) {
@@ -217,10 +200,84 @@ async function markThreadReopened(threadId, env) {
   }
 }
 
-// Turnstile 状态
+// 答题验证状态
 async function isVerified(uid, env) {
   const flag = await env.TOPIC_MAP.get(`verified:${uid}`);
   return Boolean(flag);
+}
+
+const VERIFICATION_TTL_SECONDS = 900;
+
+async function handleVerificationMessage(msg, env) {
+  const userId = msg.chat.id;
+  if (await isVerified(userId, env)) return true;
+
+  const challengeKey = `challenge:${userId}`;
+  let challenge = await env.TOPIC_MAP.get(challengeKey, { type: "json" });
+  if (!challenge) {
+    challenge = createChallenge();
+    await env.TOPIC_MAP.put(challengeKey, JSON.stringify(challenge), {
+      expirationTtl: VERIFICATION_TTL_SECONDS,
+    });
+    await sendChallenge(userId, challenge, env);
+    return false;
+  }
+
+  if (isChallengeAnswer(msg.text, challenge.answer)) {
+    await env.TOPIC_MAP.put(`verified:${userId}`, "1");
+    await env.TOPIC_MAP.delete(challengeKey);
+    await tgCall(env, "sendMessage", {
+      chat_id: userId,
+      text: "✅ 验证成功！现在可以直接给我发送消息了。",
+    });
+    console.log("verified-set", { uid: userId });
+    return false;
+  }
+
+  await tgCall(env, "sendMessage", {
+    chat_id: userId,
+    text: `❌ 答案不正确，请再试一次：\n\n${challenge.question}`,
+  });
+  return false;
+}
+
+function createChallenge() {
+  const left = randomInt(10, 99);
+  const right = randomInt(10, 99);
+  const subtraction = randomInt(0, 1) === 1;
+  const first = subtraction ? Math.max(left, right) : left;
+  const second = subtraction ? Math.min(left, right) : right;
+  const operator = subtraction ? "-" : "+";
+  return {
+    question: `${first} ${operator} ${second} = ?`,
+    answer: subtraction ? first - second : first + second,
+  };
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isChallengeAnswer(value, expected) {
+  if (typeof value !== "string") return false;
+  const normalized = value
+    .trim()
+    .replace(/[０-９]/g, (digit) => String.fromCharCode(digit.charCodeAt(0) - 0xff10 + 0x30));
+  return /^-?\d+$/.test(normalized) && Number(normalized) === expected;
+}
+
+async function sendChallenge(userId, challenge, env) {
+  await tgCall(env, "sendMessage", {
+    chat_id: userId,
+    text: [
+      "👋 欢迎使用，请先完成一个简单的数字验证。",
+      "请直接回复答案数字：",
+      "",
+      challenge.question,
+      "",
+      "验证有效期 15 分钟，答对后即可开始对话。",
+    ].join("\n"),
+  });
 }
 
 // 按 thread_id 反查用户
@@ -231,237 +288,6 @@ async function findUserByThread(threadId, env) {
     if (rec && Number(rec.thread_id) === Number(threadId)) return Number(name.slice("user:".length));
   }
   return null;
-}
-
-const TELEGRAM_FALLBACK_URL = "https://t.me";
-const VERIFY_STATUS_THEME = {
-  info: { accent: "#3460ff", accentLight: "rgba(52,96,255,0.14)", icon: "🛡️" },
-  success: { accent: "#16a34a", accentLight: "rgba(22,163,74,0.15)", icon: "✅" },
-  error: { accent: "#ef4444", accentLight: "rgba(239,68,68,0.18)", icon: "⚠️" },
-};
-
-function renderVerifyView({ status = "info", title, description = "", content = "", actions = [], includeTurnstile = false, icon, statusCode = 200 }) {
-  const theme = VERIFY_STATUS_THEME[status] || VERIFY_STATUS_THEME.info;
-  const resolvedIcon = icon === null ? "" : icon || theme.icon || "";
-  const iconHtml = resolvedIcon ? `<div class="badge">${resolvedIcon}</div>` : "";
-  const actionHtml = actions.length
-    ? `<div class="actions">${actions
-        .map(({ label, href = "#", primary = true, external }) => {
-          const target = external ? ' target="_blank" rel="noopener noreferrer"' : "";
-          return `<a class="action${primary ? " primary" : ""}" href="${href}"${target}>${label}</a>`;
-        })
-        .join("")}</div>`
-    : "";
-  const script = includeTurnstile ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : "";
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${title}</title>
-  ${script}
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      background: #f5f7fb;
-      font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
-      color: #1f2125;
-    }
-    .card {
-      width: min(460px, 92vw);
-      background: #fff;
-      border-radius: 20px;
-      padding: 32px 30px;
-      box-shadow: 0 32px 70px rgba(15,23,42,0.12);
-      text-align: center;
-      border: 1px solid rgba(15,23,42,0.05);
-    }
-    .badge {
-      width: 56px;
-      height: 56px;
-      margin: 0 auto 16px;
-      border-radius: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 28px;
-      background: var(--accent-light);
-      color: var(--accent);
-    }
-    h1 {
-      font-size: 22px;
-      margin: 0 0 12px;
-    }
-    .tip {
-      margin: 0 0 22px;
-      color: #64748b;
-      font-size: 14px;
-      line-height: 1.5;
-    }
-    form {
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-    button {
-      border: none;
-      border-radius: 12px;
-      padding: 13px;
-      font-size: 16px;
-      font-weight: 600;
-      color: #fff;
-      background: var(--accent);
-      cursor: pointer;
-      box-shadow: 0 12px 24px rgba(15,23,42,0.16);
-    }
-    button:active { transform: translateY(1px); }
-    .actions {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      margin-top: 4px;
-    }
-    .action {
-      display: inline-flex;
-      justify-content: center;
-      align-items: center;
-      padding: 12px 18px;
-      border-radius: 12px;
-      font-weight: 600;
-      text-decoration: none;
-      border: 1px solid transparent;
-      color: var(--accent);
-      background: rgba(52,96,255,0.08);
-    }
-    .action.primary {
-      color: #fff;
-      background: var(--accent);
-      border-color: var(--accent);
-      box-shadow: 0 10px 22px rgba(15,23,42,0.16);
-    }
-    .muted {
-      font-size: 13px;
-      color: #94a3b8;
-      margin: 0;
-    }
-    @media (min-width: 520px) {
-      .actions { flex-direction: row; justify-content: center; }
-    }
-  </style>
-</head>
-<body>
-  <div class="card" style="--accent:${theme.accent};--accent-light:${theme.accentLight};">
-    ${iconHtml}
-    <h1>${title}</h1>
-    ${description ? `<p class="tip">${description}</p>` : ""}
-    ${content}
-    ${actionHtml}
-  </div>
-</body>
-</html>`;
-  return new Response(html, { status: statusCode, headers: { "content-type": "text/html; charset=utf-8" } });
-}
-
-// Turnstile 页面
-function renderVerifyPage(url, env) {
-  const token = url.searchParams.get("token") || "";
-  const sitekey = env.TURNSTILE_SITEKEY;
-  if (!sitekey || !token) {
-    return renderVerifyView({
-      status: "error",
-      title: "验证链接无效",
-      description: "链接缺少必要参数，请返回 Telegram 重新点击最新的验证按钮。",
-      actions: [{ label: "返回 Telegram", href: TELEGRAM_FALLBACK_URL, external: true }],
-      statusCode: 400,
-    });
-  }
-  const formHtml = `<form method="POST" action="/verify">
-      <div class="cf-turnstile" data-sitekey="${sitekey}"></div>
-      <input type="hidden" name="token" value="${token}" />
-      <button type="submit">提交验证</button>
-      <p class="tip">验证通过后请切回 Telegram 与机器人继续对话。</p>
-    </form>`;
-  return renderVerifyView({
-    status: "info",
-    title: "请完成人机验证",
-    description: "为了保护社群安全，请完成下面的人机验证。",
-    content: formHtml,
-    includeTurnstile: true,
-    icon: "🛡️",
-  });
-}
-
-// Turnstile 提交
-async function handleVerifySubmit(request, env) {
-  const form = await request.formData();
-  const respToken = form.get("cf-turnstile-response");
-  const token = form.get("token");
-  const retryActions = token
-    ? [
-        { label: "重新验证", href: `/verify?token=${encodeURIComponent(token)}` },
-        { label: "返回 Telegram", href: TELEGRAM_FALLBACK_URL, primary: false, external: true },
-      ]
-    : [{ label: "返回 Telegram", href: TELEGRAM_FALLBACK_URL, external: true }];
-  if (!respToken || !token) {
-    return renderVerifyView({
-      status: "error",
-      title: "缺少验证信息",
-      description: "请求参数不完整，请刷新页面或重新回到 Telegram 获取验证链接。",
-      actions: retryActions,
-      statusCode: 400,
-    });
-  }
-
-  const verifyRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ secret: env.TURNSTILE_SECRET, response: respToken }),
-  });
-  const data = await verifyRes.json();
-  if (!data.success) {
-    const errors = Array.isArray(data["error-codes"]) && data["error-codes"].length ? data["error-codes"].join(", ") : "";
-    const detail = errors ? `<p class="muted">错误代码：${errors}</p>` : "";
-    return renderVerifyView({
-      status: "error",
-      title: "人机验证未通过",
-      description: "Turnstile 未能确认你是合法用户，请重新开启验证或稍后再试。",
-      content: detail,
-      actions: retryActions,
-      statusCode: 400,
-    });
-  }
-
-  const record = await env.TOPIC_MAP.get(`verify:${token}`, { type: "json" });
-  if (!record || !record.uid) {
-    return renderVerifyView({
-      status: "error",
-      title: "验证已过期",
-      description: "验证记录不存在或已超时，请回到 Telegram 重新获取新的验证链接。",
-      actions: [{ label: "返回 Telegram", href: TELEGRAM_FALLBACK_URL, external: true }],
-      statusCode: 410,
-    });
-  }
-
-  await env.TOPIC_MAP.put(`verified:${record.uid}`, "1");
-  await env.TOPIC_MAP.delete(`verify:${token}`);
-  console.log("verified-set", { uid: record.uid });
-
-  try {
-    await tgCall(env, "sendMessage", { chat_id: record.uid, text: "✅ 人机验证成功，请等待几秒数据库异地回调再和机器人的私聊继续发送消息，否则会触发无限验证。" });
-  } catch {}
-
-  return renderVerifyView({
-    status: "success",
-    title: "验证成功",
-    description: "系统已记录你的验证结果，稍候即可恢复与机器人的对话。",
-    content: '<p class="tip">请先等待 3~5 秒再回到 Telegram 发送下一条消息，然后手动关闭此页面即可。</p>',
-  });
 }
 
 // ---------------- 媒体组批量发送：攒到 10 张，或 2 秒未追加则发送 ----------------
